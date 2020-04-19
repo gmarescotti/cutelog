@@ -3,17 +3,18 @@ import pickle
 import struct
 import time
 
-from qtpy.QtCore import QThread, Signal
-from qtpy.QtNetwork import QHostAddress, QTcpServer, QTcpSocket
+from qtpy.QtCore import QThread, Signal, QObject
+from qtpy.QtNetwork import QHostAddress, QTcpServer, QTcpSocket, QUdpSocket
 
 from .config import CONFIG, MSGPACK_SUPPORT, CBOR_SUPPORT
 from .logger_tab import LogRecord
 from .utils import show_critical_dialog
 
-
-class LogServer(QTcpServer):
+class LogTcpServer(QTcpServer):
     def __init__(self, main_window, on_connection, log):
         super().__init__(main_window)
+        self.tcp = True
+        
         self.log = log.getChild('TCP')
 
         self.log.info('Initializing')
@@ -46,7 +47,7 @@ class LogServer(QTcpServer):
         else:
             address = "{}:{}".format(self.host.toString(), self.port)
             self.main_window.set_status('Server is listening on {}...'.format(address))
-
+                
     def incomingConnection(self, socketDescriptor):
         self.conn_count += 1
         conn_id = str(self.conn_count)
@@ -88,6 +89,86 @@ class LogServer(QTcpServer):
             self.log.error('Double delete on connection: {}'.format(connection), exc_info=True)
             return
 
+class LogUdpServer(QObject):
+    def __init__(self, main_window, on_connection, log):
+        super().__init__(main_window)
+        self.tcp = False
+        
+        self.log = log.getChild('UDP')
+
+        self.log.info('Initializing')
+
+        self.main_window = main_window
+        self.on_connection = on_connection
+
+        self.host, self.port = CONFIG.listen_address
+        self.host = QHostAddress(self.host)
+        self.benchmark = CONFIG['benchmark']
+        self.conn_count = 0
+
+        self.threads = []
+
+    def start(self):
+        self.log.info('Starting the server')
+        if self.benchmark:
+            self.log.debug('Starting a benchmark connection')
+            new_conn = BenchmarkConnection(self, None, "benchmark", self.log)
+            new_conn.finished.connect(new_conn.deleteLater)
+            new_conn.connection_finished.connect(self.cleanup_connection)
+            self.on_connection(new_conn, -1)
+            self.threads.append(new_conn)
+            new_conn.start()
+
+#             result = self.bind(self.host, self.port)
+#             assert result, "Error while binding server"
+        address = "{}:{}".format(self.host.toString(), self.port)
+        self.main_window.set_status('Server is listening on {}...'.format(address))
+        
+        self.incomingConnection(self)
+
+    def close(self):
+        pass # udp is connectionless
+    
+    def incomingConnection(self, socketDescriptor):
+        self.conn_count += 1
+        conn_id = str(self.conn_count)
+        self.log.info('New connection id={}'.format(conn_id))
+        new_conn = LogConnection(self, socketDescriptor, conn_id, self.log)
+
+        self.on_connection(new_conn, conn_id)
+        new_conn.setObjectName(conn_id)
+        new_conn.finished.connect(new_conn.deleteLater)
+        new_conn.connection_finished.connect(self.cleanup_connection)
+        new_conn.start()
+        self.threads.append(new_conn)
+
+    def close_server(self):
+        self.log.debug('Closing the server')
+        self.main_window.set_status('Stopping the server...')
+        self.close()
+        for thread in self.threads.copy():
+            thread.requestInterruption()
+        self.wait_connections_stopped()
+        self.main_window.set_status('Server has stopped')
+
+    def wait_connections_stopped(self):
+        self.log.debug('Waiting for {} connections threads to stop'.format(len(self.threads)))
+        for thread in self.threads.copy():
+            try:
+                if not thread.wait(1500):
+                    # @Hmm: sometimes wait() complains about QThread waiting on itself
+                    self.log.debug("Thread \"{}\" didn't stop in time, exiting".format(thread))
+                    return
+            except RuntimeError:  # happens when thread has been deleted before we got to it
+                self.log.debug('Thread {} has been deleted already'.format(thread))
+        self.log.debug('Waiting for connections has stopped')
+
+    def cleanup_connection(self, connection):
+        try:
+            self.threads.remove(connection)
+        except Exception:
+            self.log.error('Double delete on connection: {}'.format(connection), exc_info=True)
+            return
 
 class LogConnection(QThread):
 
@@ -97,6 +178,7 @@ class LogConnection(QThread):
 
     def __init__(self, parent, socketDescriptor, conn_id, log):
         super().__init__(parent)
+        self.tcp = parent.tcp
         self.log = log.getChild(conn_id)
         self.socketDescriptor = socketDescriptor
         self.conn_id = conn_id
@@ -121,6 +203,9 @@ class LogConnection(QThread):
         self.log.debug('Connection id={} is starting'.format(self.conn_id))
 
         def wait_and_read(n_bytes):
+            return self.tcp_wait_and_read(n_bytes) if self.tcp else udp_wait_and_read(n_bytes)
+        
+        def tcp_wait_and_read(n_bytes):
             """
             Convenience function that simplifies reading and checking for stop events, etc.
             Returns a byte string of length n_bytes or None if socket needs to be closed.
@@ -143,9 +228,41 @@ class LogConnection(QThread):
                 data += new_data
             return data
 
-        sock = QTcpSocket(None)
-        sock.setSocketDescriptor(self.socketDescriptor)
-        sock.waitForConnected()
+        def udp_wait_and_read(n_bytes):
+            """
+            Convenience function that simplifies reading and checking for stop events, etc.
+            Returns a byte string of length n_bytes or None if socket needs to be closed.
+            """
+            
+            if getattr(self, 'udpbuffer', None) is None: self.udpbuffer=b''
+            
+            while len(self.udpbuffer) < n_bytes:
+                if sock.bytesAvailable() == 0:
+                    new_data = sock.waitForReadyRead(100)  # wait for 100ms between read attempts
+                    if not new_data:
+                        if sock.state() != sock.BoundState or self.need_to_stop():
+                            return None
+                        else:
+                            continue
+                        
+                if self.need_to_stop():
+                    return None
+
+                new_data = sock.receiveDatagram().data().data()
+
+                self.udpbuffer += new_data
+
+            ret = self.udpbuffer[:n_bytes]
+            self.udpbuffer = self.udpbuffer[n_bytes:]
+            return ret
+
+        if self.tcp:
+            sock = QTcpSocket(None)
+            sock.setSocketDescriptor(self.socketDescriptor)
+            sock.waitForConnected()
+        else:
+            sock = QUdpSocket(None)
+            assert sock.bind(self.socketDescriptor.host, self.socketDescriptor.port)
 
         while True:
             read_len = wait_and_read(4)
@@ -167,7 +284,7 @@ class LogConnection(QThread):
                 logDict = self.deserialize(data)
                 record = LogRecord(logDict)
             except Exception:
-                self.log.error('Creating log record failed', exc_info=True)
+                self.log.exception('Creating log record failed') # , exc_info=True)
                 continue
             self.new_record.emit(record)
 

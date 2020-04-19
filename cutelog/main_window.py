@@ -4,13 +4,14 @@ from qtpy.QtWidgets import (QFileDialog, QInputDialog, QMainWindow, QMenuBar,
 
 from .about_dialog import AboutDialog
 from .config import CONFIG
-from .listener import LogServer
+from .listener import LogTcpServer, LogUdpServer
 from .logger_tab import LoggerTab, LogRecord
 from .merge_dialog import MergeDialog
 from .pop_in_dialog import PopInDialog
 from .settings_dialog import SettingsDialog
 from .utils import (center_widget_on_screen, show_critical_dialog,
                     show_warning_dialog)
+import sys
 
 
 class MainWindow(QMainWindow):
@@ -236,7 +237,10 @@ class MainWindow(QMainWindow):
 
     def start_server(self):
         self.log.debug('Starting the server')
-        self.server = LogServer(self, self.on_connection, self.log)
+        if "-udp" in sys.argv:
+            self.server = LogUdpServer(self, self.on_connection, self.log)
+        else:
+            self.server = LogTcpServer(self, self.on_connection, self.log)
         self.server.start()
         self.server_running = True
         self.actionStartStopServer.setText('Stop server')
