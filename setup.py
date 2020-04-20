@@ -71,7 +71,7 @@ setup(
         "Topic :: System :: Monitoring",
     ],
     download_url="https://github.com/Busimus/cutelog/archive/{}.zip".format(VERSION),
-    entry_points={'console_scripts': 'cutelog=cutelog.__main__:main'},
+    entry_points={'gui_scripts': 'cutelog=cutelog.__main__:main'},
     include_package_data=True,
     keywords=["log", "logging", "gui", "qt"],
     license="MIT",
